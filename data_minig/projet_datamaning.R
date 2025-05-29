@@ -1,0 +1,164 @@
+# Chargement des données
+# Remplace les backslashes pour éviter erreurs de chemin
+file_path <- "C:/data_minig/hotel_bookings (1).csv"
+data <- read.csv(file_path, stringsAsFactors = TRUE)
+
+# Vérifier si le dataset s'est bien chargé
+if (!exists("data") || !is.data.frame(data)) {
+  stop("Erreur: Données non chargées.")
+} else {
+  print("Données chargées")
+}
+
+# Nettoyage NA
+data$children[is.na(data$children)] <- 0
+data$babies[is.na(data$babies)] <- 0
+data$agent <- as.numeric(as.character(data$agent))
+data$agent[is.na(data$agent)] <- 0
+data$company <- as.numeric(as.character(data$company))
+data$company[is.na(data$company)] <- 0
+data <- data[!is.na(data$adr), ]
+
+# Sélection des colonnes
+cols <- c("is_repeated_guest", "previous_bookings_not_canceled",
+          "market_segment", "distribution_channel", "hotel",
+          "deposit_type", "total_of_special_requests", "adr")
+data_ml <- data[, cols]
+
+# Encodage manuel
+library(dplyr)
+data_ml <- data_ml %>%
+  mutate(
+    market_segment = as.numeric(as.factor(market_segment)),
+    distribution_channel = as.numeric(as.factor(distribution_channel)),
+    hotel = as.numeric(as.factor(hotel)),
+    deposit_type = as.numeric(as.factor(deposit_type)),
+    is_repeated_guest = as.factor(is_repeated_guest)
+  )
+
+# Vérification
+if (nrow(data_ml) > 0) {
+  cat("\u2705 data_ml a été créé avec succès :\n")
+  print(head(data_ml, 3))
+} else {
+  stop("\u274c data_ml vide.")
+}
+
+# Split (80/20)
+set.seed(123)
+n <- nrow(data_ml)
+index <- sample(seq_len(n), size = 0.8 * n)
+train_data <- data_ml[index, ]
+test_data <- data_ml[-index, ]
+
+cat("\u2705 Dimensions des datasets :\n")
+cat("Train :", nrow(train_data), "lignes\n")
+cat("Test :", nrow(test_data), "lignes\n")
+
+# Standardisation
+numeric_cols <- c("previous_bookings_not_canceled", "adr", "total_of_special_requests")
+means <- sapply(train_data[numeric_cols], mean)
+sds <- sapply(train_data[numeric_cols], sd)
+train_data[numeric_cols] <- scale(train_data[numeric_cols], center = means, scale = sds)
+test_data[numeric_cols] <- scale(test_data[numeric_cols], center = means, scale = sds)
+
+cat("\u2705 Aperçu des données standardisées (train_data) :\n")
+print(head(train_data[numeric_cols]))
+
+# K-means
+set.seed(123)
+kmeans_result <- kmeans(train_data[, numeric_cols], centers = 2, nstart = 25)
+train_clusters <- kmeans_result$cluster
+
+assign_cluster <- function(obs, centers) {
+  dists <- apply(centers, 1, function(center) sum((obs - center)^2))
+  return(which.min(dists))
+}
+
+test_clusters <- apply(test_data[, numeric_cols], 1, assign_cluster, centers = kmeans_result$centers)
+
+train_data$is_repeated_guest <- factor(train_data$is_repeated_guest)
+test_data$is_repeated_guest <- factor(test_data$is_repeated_guest)
+
+confusion_train <- table(Cluster = train_clusters, RepeatedGuest = train_data$is_repeated_guest)
+cat("\n\U0001F4CA Matrice de confusion - TRAIN :\n")
+print(confusion_train)
+acc_train <- sum(apply(confusion_train, 1, max)) / sum(confusion_train)
+cat(sprintf("\n\u2705 Accuracy (train) K-means : %.2f%%\n", acc_train * 100))
+
+confusion_test <- table(Cluster = test_clusters, RepeatedGuest = test_data$is_repeated_guest)
+cat("\n\U0001F4CA Matrice de confusion - TEST :\n")
+print(confusion_test)
+acc_test <- sum(apply(confusion_test, 1, max)) / sum(confusion_test)
+cat(sprintf("\n\u2705 Accuracy (test) K-means : %.2f%%\n", acc_test * 100))
+
+# k-NN
+library(class)
+vars_var <- apply(train_data[, -1], 2, var)
+vars_to_keep <- vars_var > 1e-5
+train_clean <- as.data.frame(train_data[, c(TRUE, vars_to_keep)])
+test_clean <- as.data.frame(test_data[, c(TRUE, vars_to_keep)])
+train_clean[, -1] <- jitter(as.matrix(train_clean[, -1]), amount = 1e-5)
+test_clean[, -1] <- jitter(as.matrix(test_clean[, -1]), amount = 1e-5)
+
+knn_pred <- knn(train = train_clean[, -1], test = test_clean[, -1], cl = train_clean$is_repeated_guest, k = 3)
+conf_mat <- table(Prediction = knn_pred, Verite = test_clean$is_repeated_guest)
+print(conf_mat)
+accuracy <- sum(diag(conf_mat)) / sum(conf_mat)
+cat("Accuracy k-NN:", round(accuracy * 100, 2), "%\n")
+
+# Arbre manuel
+tree_pred_manual <- rep("0", nrow(test_data))
+tree_pred_manual[test_data$previous_bookings_not_canceled > 0.5] <- "1"
+tree_pred_manual[test_data$adr > 0] <- "1"
+tree_pred_manual <- factor(tree_pred_manual, levels = levels(test_data$is_repeated_guest))
+
+conf_mat_manual <- table(Prediction = tree_pred_manual, Realite = test_data$is_repeated_guest)
+print(conf_mat_manual)
+acc_manual <- sum(diag(conf_mat_manual)) / sum(conf_mat_manual)
+
+# Résumé des accuracies
+cat("\n\n===== Rapport des Accuracies des 3 Algorithmes =====\n")
+cat(sprintf("\n1. K-means : %.2f%%\n", acc_test * 100))
+cat(sprintf("\n2. k-NN : %.2f%%\n", accuracy * 100))
+cat(sprintf("\n3. Arbre manuel : %.2f%%\n", acc_manual * 100))
+
+if (accuracy >= acc_test & accuracy >= acc_manual) {
+  cat("\n=> k-NN est le meilleur algorithme\n")
+} else if (acc_manual >= accuracy & acc_manual >= acc_test) {
+  cat("\n=> L’arbre manuel est le meilleur\n")
+} else {
+  cat("\n=> K-means est le meilleur\n")
+}
+# Visualisation
+library(ggplot2)
+plot_data <- test_data
+if (best_algo == "knn") {
+  plot_data$pred <- knn_pred
+} else if (best_algo == "kmeans") {
+  plot_data$pred <- factor(test_clusters, levels = levels(test_data$is_repeated_guest))
+} else if (best_algo == "tree") {
+  plot_data$pred <- tree_pred_manual
+}
+
+ggplot(plot_data, aes(x = adr, y = previous_bookings_not_canceled, color = pred, shape = is_repeated_guest)) +
+  geom_point(alpha = 0.7, size = 3) +
+  labs(title = paste("Visualisation des prédictions de l'algorithme:", best_algo),
+       x = "adr (standardisé)",
+       y = "previous_bookings_not_canceled (standardisé)",
+       color = "Prédiction",
+       shape = "Vérité") +
+  theme_minimal()
+
+# Ajouter un tableau final résumant les accuracy
+accuracy_table <- data.frame(
+  Algorithme = c("K-means", "k-NN", "Arbre manuel"),
+  Accuracy = c(acc_kmeans, acc_knn, acc_tree)
+)
+
+cat("\n\n===== Tableau récapitulatif des accuracies =====\n")
+print(accuracy_table)
+
+
+
+
